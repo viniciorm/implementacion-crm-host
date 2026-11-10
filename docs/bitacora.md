@@ -47,3 +47,7 @@ Preparar e instalar dependencias de Laravel y construir el circuito completo: in
 Se preparó una regla aislada para vincular una identidad previamente verificada con una cuenta ya autorizada y activa. La vinculación debe conservar el identificador estable del proveedor, verificar el correo inicial y rechazar cambios inesperados de identidad. La primera vinculación necesitará una transacción y una restricción única para evitar carreras.
 
 **Estado:** propuesta de código en revisión; los casos unitarios independientes pasaron en un entorno local. Esto no prueba el flujo de autenticación completo. La regla no verifica tokens ni implementa sesiones o inicio de sesión. Quedan pendientes la integración con Laravel, pruebas de extremo a extremo y la configuración del proveedor.
+
+## Prueba local del framework
+
+Se descargó una instalación de prueba del framework en un entorno aislado. El arranque falló al intentar escribir archivos de caché por permisos del entorno de pruebas; no se ha determinado que exista el mismo problema en el hosting. No se ha validado aún la versión definitiva de dependencias para el servidor ni se ha desplegado la aplicación.
