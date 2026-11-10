@@ -51,3 +51,63 @@ Se preparó una regla aislada para vincular una identidad previamente verificada
 ## Prueba local del framework
 
 Se descargó una instalación de prueba del framework en un entorno aislado. El arranque falló al intentar escribir archivos de caché por permisos del entorno de pruebas; no se ha determinado que exista el mismo problema en el hosting. No se ha validado aún la versión definitiva de dependencias para el servidor ni se ha desplegado la aplicación.
+
+
+## Diagnóstico seguro del hosting compartido sin exposición web
+
+Para determinar las capacidades reales del servidor sin exponer información sensible ni crear endpoints administrativos públicos, se preparó un script de diagnóstico ejecutable exclusivamente vía CLI o tarea de cron temporal:
+
+- Restricción estricta de entorno: valida que `php_sapi_name() === 'cli'`, finalizando inmediatamente si se invoca desde la web.
+- Comprobación de binarios: inspecciona rutas estándar del panel (`ea-php84`, `alt-php84`, `composer`) para contrastar el PHP web con el PHP de la línea de comandos.
+- Verificación de extensiones: valida la presencia de `pdo_mysql`, `openssl`, `curl`, `mbstring`, `fileinfo` y `intl`.
+- Conectividad saliente: evalúa mediante conexiones seguras la disponibilidad de los servicios de identidad y hojas de cálculo.
+- Registro privado: escribe los resultados únicamente en una ruta privada fuera del área pública (`public_html`), garantizando que la salida no sea accesible vía navegador.
+
+**Aprendizaje:** en hosting compartido, nunca se deben crear scripts web temporales que ejecuten comandos del sistema o expongan `phpinfo()`. Las tareas de cron con salida a un archivo privado y retiro inmediato posterior ofrecen una vía segura y controlada para auditar el entorno.
+
+## Implementación de Laravel con separación física de directorios
+
+Se construyó la estructura completa de la aplicación backend dentro de la carpeta correspondiente, adoptando un diseño desacoplado para hosting compartido:
+
+- Área privada: contiene el núcleo de la aplicación, controladores, modelos, migraciones, dependencias (`vendor/`), configuración y el archivo `.env`.
+- Área pública: contiene exclusivamente el punto de entrada `index.php`, los estilos de marca y el archivo `.htaccess` configurado con `Options -Indexes` y cabeceras de seguridad (`X-Frame-Options`, `X-Content-Type-Options`).
+- Resolución dinámica de rutas: `index.php` detecta automáticamente si se encuentra en un entorno de desarrollo local o en la estructura separada de hosting compartido, registrando la ruta pública efectiva sin requerir rutas absolutas cableadas en el código fuente.
+- Prevención de fallos de caché: se aseguraron las carpetas internas de `storage/framework/cache/data`, `storage/framework/sessions`, `storage/framework/views` y `storage/logs` con exclusiones adecuadas de control de versiones.
+
+## Integración de autenticación Google OpenID Connect y vinculación atómica
+
+Se implementó el flujo completo de autenticación directa con el proveedor de identidad sin dependencias externas:
+
+- Protección de flujo: generación de un token de estado CSRF criptográfico almacenado en sesión y verificado en el callback.
+- Intercambio seguro: canje de código por tokens y verificación de identidad y correo confirmado contra el endpoint oficial del proveedor.
+- Vinculación atómica y prevención de colisiones:
+  - Solo se admiten correos previamente autorizados y activos en la base de datos.
+  - En el primer inicio de sesión, el identificador único y estable del proveedor (`sub`) se vincula dentro de una transacción con bloqueo de fila (`lockForUpdate`), aplicando una restricción de unicidad para impedir carreras concurrentes.
+  - En inicios de sesión posteriores, se exige coincidencia estricta del identificador vinculado.
+- Gestión de sesiones: regeneración del ID de sesión al autenticar para mitigar ataques de fijación de sesión, y middleware para expulsar de inmediato a usuarios desactivados.
+
+## Sincronización idempotente y persistencia desacoplada
+
+Se implementó la lectura de las hojas de cálculo autorizadas mediante una cuenta de servicio configurada con alcance estricto de solo lectura:
+
+- Canal seguro de lectura: firma de aserción JWT mediante algoritmo RS256 con la clave privada de la cuenta de servicio y alcance exclusivo `spreadsheets.readonly`.
+- Validación por lote: detección de identificadores repetidos en una misma hoja, rechazando ambas filas para revisión manual sin aceptar duplicados silenciosamente.
+- Idempotencia: cálculo de clave única basada en hoja e ID de origen; ejecuciones posteriores actualizan marcas de tiempo pero conservan intactos los estados comerciales, notas de gestión, reasignaciones internas y seguimientos.
+- Trazabilidad y auditoría: registro de cada inicio de sesión, cambio de estado, reasignación, creación de gestión y sincronización en tablas dedicadas.
+
+## Verificación integral mediante pruebas automatizadas
+
+Se construyó y ejecutó una suite de pruebas con 29 casos automatizados y 103 aserciones que validaron:
+
+1. Rechazo de accesos no autenticados en todas las rutas protegidas.
+2. Rechazo inmediato de usuarios inactivos o no autorizados.
+3. Validación estricta de estado CSRF en el flujo de identidad.
+4. Rechazo de correos no verificados por el proveedor.
+5. Vinculación atómica del identificador único y prevención de colisiones.
+6. Aislamiento entre asesores: imposibilidad de que un asesor consulte o modifique prospectos asignados a otro.
+7. Mapeo de encabezados para los cuatro esquemas soportados y detección de encabezados ambiguos o faltantes.
+8. Rechazo de duplicados a nivel de lote.
+9. Idempotencia y conservación de datos comerciales tras sincronizaciones repetidas.
+10. Persistencia real de notas, llamadas, estados y seguimientos.
+11. Verificación de que el cliente de hojas realiza exclusivamente peticiones GET y nunca escrituras.
+12. Comprobación de que la configuración, `.env` y archivos privados no residen en el directorio público.
