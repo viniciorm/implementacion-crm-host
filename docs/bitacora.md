@@ -122,17 +122,25 @@ Para garantizar que procesos web independientes y tareas programadas por línea 
   - El comando programado omite su ejecución y registra evento de auditoría si la sincronización manual está activa.
   - Ante cualquier excepción imprevista (fallo de red, archivo no encontrado o respuesta corrupta de la API externa), el bloqueo se libera estrictamente en el bloque `finally`, evitando bloqueos residuales o bloqueos permanentes innecesarios.
 
-## Reconciliación explícita de prospectos al habilitar asesores
+## Reconciliación determinista con bloqueo pesimista de fila
 
-Para gestionar prospectos previamente importados cuyos responsables originales no estaban habilitados inicialmente:
+Para proteger la integridad de las asignaciones ante operaciones simultáneas en la base de datos:
 
-- Preservación estricta de asignaciones manuales: si un prospecto pendiente fue asignado manualmente por un usuario interno en el CRM, la reconciliación automática respeta y preserva intacta dicha asignación sin sobrescribirla.
-- Resolución determinista sin inferencias: solo se reconcilian prospectos cuyo alias de origen coincida exactamente con un mapeo configurado y cuyo asesor esté activo en la base de datos con el rol respectivo.
-- Trazabilidad y conciliación: los prospectos reconciliados registran una nota de actividad y un evento de auditoría; los prospectos ambiguos o sin asesor habilitado permanecen transparentemente con estado pendiente de conciliación.
+- Bloqueo exclusivo dentro de transacción: en lugar de confiar en datos leídos previamente fuera del contexto transaccional, el proceso de reconciliación vuelve a consultar y bloquea explícitamente tanto el registro del prospecto como su fila de gestión (`SELECT ... FOR UPDATE` en `leads` y `lead_management`).
+- Detección de asignación manual concurrente: si un administrador o asesor asigna un prospecto manualmente mientras el proceso de reconciliación evalúa el lote, al adquirir el bloqueo exclusivo el proceso detecta que `assigned_user_id` ya no es nulo, preserva intacta la asignación manual previa y marca el prospecto como resuelto sin sobrescribir con el asesor automático.
+- Prueba reproducible para MySQL / MariaDB: se incorporó un script de verificación que simula dos conexiones PDO simultáneas contra InnoDB, demostrando que la segunda conexión queda retenida hasta que la primera conexión hace commit de su asignación manual, impidiendo cualquier colisión.
+
+## Mitigación de tareas extensas (>600s) y uso de la opción forzada
+
+- Renovación activa del bloqueo (heartbeat): para tareas de sincronización de gran volumen que puedan extenderse más allá del TTL predeterminado de 600 segundos, el sistema renueva activamente la expiración del bloqueo atómico (`$lock->refresh()`) antes de procesar cada hoja y periódicamente durante el lote, impidiendo que el bloqueo expire y que otra tarea programada inicie en paralelo.
+- Uso controlado de la opción `--force`:
+  - Propósito: diseñada exclusivamente para recuperación administrativa cuando un proceso previo fue interrumpido abruptamente por el sistema operativo (ej. falta de memoria, reinicio de servidor) y dejó un bloqueo huérfano en la tabla `cache_locks`.
+  - Acción: libera forzosamente el bloqueo residual, audita el evento `sync.forced_lock_release` y adquiere un nuevo bloqueo limpio.
+  - Advertencia: jamás debe utilizarse en trabajos automáticos de Cron, ya que anularía la protección de concurrencia si una tarea legítima se encuentra ejecutándose.
 
 ## Verificación integral mediante pruebas automatizadas
 
-Se construyó y ejecutó una suite de pruebas con 53 casos automatizados y 200 aserciones que validaron:
+Se construyó y ejecutó una suite de pruebas con 55 casos automatizados y 212 aserciones que validaron:
 
 1. Rechazo de accesos no autenticados en todas las rutas protegidas.
 2. Rechazo inmediato de usuarios inactivos o no autorizados.
@@ -145,18 +153,21 @@ Se construyó y ejecutó una suite de pruebas con 53 casos automatizados y 200 a
 9. Doble comprobación post-bloqueo en vinculación concurrente y prevención de carreras.
 10. Aislamiento estricto entre asesores (HTTP 403 verificado).
 11. Mapeo explícito de asesores de origen y marcado automático de casos ambiguos para conciliación.
-12. Reconciliación explícita sin alteración de asignaciones manuales previas.
-13. Actualización de atributos de contacto modificados en la fuente sin alteración de datos comerciales del sistema.
-14. Rechazo de identificadores duplicados a nivel de lote.
-15. Idempotencia y conservación de notas, llamadas, estados y seguimientos tras sincronizaciones repetidas.
-16. Verificación de que el cliente de hojas realiza exclusivamente peticiones GET y nunca escrituras.
-17. Bloqueo compartido entre sincronización manual y comando CLI, previniendo ejecuciones superpuestas.
-18. Liberación garantizada del bloqueo de sincronización ante excepciones y fallos simulados.
-19. Comprobación de que la configuración, `.env` y archivos privados no residen en el directorio público.
+12. Reconciliación explícita con bloqueo de fila y re-consulta transaccional.
+13. Preservación estricta de asignaciones manuales concurrentes ante carreras con el proceso de reconciliación.
+14. Actualización de atributos de contacto modificados en la fuente sin alteración de datos comerciales del sistema.
+15. Rechazo de identificadores duplicados a nivel de lote.
+16. Idempotencia y conservación de notas, llamadas, estados y seguimientos tras sincronizaciones repetidas.
+17. Verificación de que el cliente de hojas realiza exclusivamente peticiones GET y nunca escrituras.
+18. Bloqueo compartido entre sincronización manual y comando CLI, previniendo ejecuciones superpuestas.
+19. Renovación de bloqueo (heartbeat) para sincronizaciones extensas (>600s).
+20. Liberación forzada controlada mediante `--force` ante bloqueos huérfanos con registro de auditoría.
+21. Liberación garantizada del bloqueo de sincronización ante excepciones y fallos simulados.
+22. Comprobación de que la configuración, `.env` y archivos privados no residen en el directorio público.
 
 ## Estado del desarrollo y limitaciones pendientes
 
-- **Commit de referencia:** `915a34be10b7c78fb229704ba91b2dd39e104104` (rama de características del CRM).
+- **Commit de referencia:** `d67cfd587eb6a81561853f93e52d18c1e29c936a` (rama de características del CRM).
 - **Limitaciones pendientes:**
   - Las tareas periódicas en Cron se encuentran temporalmente desactivadas en el servidor hasta completar la validación manual inicial en producción.
   - Los asesores con asignaciones históricas no confirmadas permanecen inhabilitados; sus registros se encuentran marcados como pendientes de conciliación.
