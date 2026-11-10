@@ -128,11 +128,21 @@ Para proteger la integridad de las asignaciones ante operaciones simultáneas en
 
 - Bloqueo exclusivo dentro de transacción: en lugar de confiar en datos leídos previamente fuera del contexto transaccional, el proceso de reconciliación vuelve a consultar y bloquea explícitamente tanto el registro del prospecto como su fila de gestión (`SELECT ... FOR UPDATE` en `leads` y `lead_management`).
 - Detección de asignación manual concurrente: si un administrador o asesor asigna un prospecto manualmente mientras el proceso de reconciliación evalúa el lote, al adquirir el bloqueo exclusivo el proceso detecta que `assigned_user_id` ya no es nulo, preserva intacta la asignación manual previa y marca el prospecto como resuelto sin sobrescribir con el asesor automático.
-- Prueba reproducible para MySQL / MariaDB: se incorporó un script de verificación que simula dos conexiones PDO simultáneas contra InnoDB, demostrando que la segunda conexión queda retenida hasta que la primera conexión hace commit de su asignación manual, impidiendo cualquier colisión.
+- Prueba con dos procesos concurrentes sincronizados para MySQL / MariaDB (InnoDB):
+  - Se implementó una prueba reproducible con dos subprocesos del sistema operativo (`proc_open`) conectados a InnoDB.
+  - El Proceso A inicia transacción y adquiere `SELECT ... FOR UPDATE` sobre la fila de gestión.
+  - El Proceso B inicia transacción concurrente e intenta ejecutar `SELECT ... FOR UPDATE` sobre la misma fila, quedando físicamente retenido en `LOCK WAIT` por el motor de base de datos.
+  - El Proceso A retiene el bloqueo intencionalmente durante un intervalo medible, realiza la asignación manual a un asesor y ejecuta `COMMIT`.
+  - El Proceso B se desbloquea inmediatamente tras el `COMMIT`, mide el tiempo de espera efectivo (demostrando la exclusión mutua de InnoDB), comprueba que la fila ya tiene asignación manual y la preserva sin sobrescribirla.
+  - Distinción estricta de pruebas omitidas: si el servidor MySQL no se encuentra disponible o no se configuró una base de datos de pruebas aislada, la prueba se reporta de forma inequívoca como **OMITIDA (SKIPPED)** tanto en PHPUnit como en el ejecutable CLI (`[PRUEBA OMITIDA - NO APROBADA]`), impidiendo presentarla falsamente como aprobada en entornos SQLite en memoria.
 
-## Mitigación de tareas extensas (>600s) y uso de la opción forzada
+## Mitigación de tareas extensas (>600s), renovación estricta y uso de la opción forzada
 
-- Renovación activa del bloqueo (heartbeat): para tareas de sincronización de gran volumen que puedan extenderse más allá del TTL predeterminado de 600 segundos, el sistema renueva activamente la expiración del bloqueo atómico (`$lock->refresh()`) antes de procesar cada hoja y periódicamente durante el lote, impidiendo que el bloqueo expire y que otra tarea programada inicie en paralelo.
+- Bloqueo compartido en base de datos (`cache_locks`): la sincronización manual (Web HTTP) y la sincronización automática (CLI Cron) utilizan explícitamente el almacén de base de datos (`DatabaseLock`), garantizando que dos procesos de sistema operativo independientes compartan el mismo cerrojo atómico y dispongan de la funcionalidad nativa de renovación (`refresh()`).
+- Verificación estricta de propiedad y renovación (`refresh()`):
+  - El método `refresh()` de `DatabaseLock` ejecuta una actualización atómica con condición de vigencia y propietario. Si el bloqueo expiró o fue adquirido por otro proceso, `refresh()` retorna estrictamente `false`.
+  - El sistema nunca silencia un fallo de renovación. Ante `false`, registra inmediatamente el evento de auditoría `sync.lock_lost`, interrumpe el procesamiento y arroja una excepción en tiempo de ejecución, lo que dispara un `rollback` transaccional en la base de datos para prevenir colisiones o escrituras sin exclusividad.
+- Renovación periódica (heartbeat) intra-hoja y entre hojas: para prevenir expiraciones durante la ingesta de grandes volúmenes de datos, el pulso de renovación se ejecuta antes de consultar cada hoja autorizada y periódicamente dentro de cada hoja (cada 25 registros procesados).
 - Uso controlado de la opción `--force`:
   - Propósito: diseñada exclusivamente para recuperación administrativa cuando un proceso previo fue interrumpido abruptamente por el sistema operativo (ej. falta de memoria, reinicio de servidor) y dejó un bloqueo huérfano en la tabla `cache_locks`.
   - Acción: libera forzosamente el bloqueo residual, audita el evento `sync.forced_lock_release` y adquiere un nuevo bloqueo limpio.
@@ -140,7 +150,7 @@ Para proteger la integridad de las asignaciones ante operaciones simultáneas en
 
 ## Verificación integral mediante pruebas automatizadas
 
-Se construyó y ejecutó una suite de pruebas con 55 casos automatizados y 212 aserciones que validaron:
+Se construyó y ejecutó una suite de pruebas con 60 casos automatizados y 231 aserciones (59 aprobadas, 1 omitida por requerir MySQL/MariaDB aislado):
 
 1. Rechazo de accesos no autenticados en todas las rutas protegidas.
 2. Rechazo inmediato de usuarios inactivos o no autorizados.
@@ -159,16 +169,22 @@ Se construyó y ejecutó una suite de pruebas con 55 casos automatizados y 212 a
 15. Rechazo de identificadores duplicados a nivel de lote.
 16. Idempotencia y conservación de notas, llamadas, estados y seguimientos tras sincronizaciones repetidas.
 17. Verificación de que el cliente de hojas realiza exclusivamente peticiones GET y nunca escrituras.
-18. Bloqueo compartido entre sincronización manual y comando CLI, previniendo ejecuciones superpuestas.
-19. Renovación de bloqueo (heartbeat) para sincronizaciones extensas (>600s).
-20. Liberación forzada controlada mediante `--force` ante bloqueos huérfanos con registro de auditoría.
-21. Liberación garantizada del bloqueo de sincronización ante excepciones y fallos simulados.
-22. Comprobación de que la configuración, `.env` y archivos privados no residen en el directorio público.
+18. Bloqueo compartido entre sincronización manual y comando CLI en controlador de base de datos real.
+19. Exclusión mutua comprobada entre dos procesos independientes que intentan adquirir el mismo bloqueo en `cache_locks`.
+20. Comprobación de que la expiración del bloqueo en base de datos permite la adquisición por un nuevo proceso e invalida la titularidad del propietario anterior.
+21. Renovación de bloqueo (heartbeat) intra-hoja y entre hojas para operaciones extensas (>600s).
+22. Interrupción inmediata y registro de auditoría (`sync.lock_lost`) si la renovación del bloqueo falla durante la ejecución.
+23. Reversión completa de base de datos (`rollback`) si se interrumpe la sincronización por pérdida de bloqueo.
+24. Liberación forzada controlada mediante `--force` ante bloqueos huérfanos con registro de auditoría.
+25. Liberación garantizada del bloqueo de sincronización ante excepciones y fallos simulados en bloque `finally`.
+26. Comprobación de que la configuración, `.env` y archivos privados no residen en el directorio público.
+27. Prueba de concurrencia y bloqueo InnoDB entre 2 subprocesos independientes del SO (omitida en SQLite; lista para validación en base MySQL aislada).
 
 ## Estado del desarrollo y limitaciones pendientes
 
-- **Commit de referencia:** `d67cfd587eb6a81561853f93e52d18c1e29c936a` (rama de características del CRM).
+- **Commit de referencia:** `9732330bae229973d93c566e84cbdc52eaf1dc0d` (rama de características del CRM).
 - **Limitaciones pendientes:**
   - Las tareas periódicas en Cron se encuentran temporalmente desactivadas en el servidor hasta completar la validación manual inicial en producción.
   - Los asesores con asignaciones históricas no confirmadas permanecen inhabilitados; sus registros se encuentran marcados como pendientes de conciliación.
+  - La prueba concurrente de dos procesos en MySQL/MariaDB requiere la provisión de la base de datos de pruebas aislada en el servidor para pasar de omitida a ejecutada en ese motor específico.
   - La ejecución de migraciones en la base de datos final y la generación de la clave criptográfica única de la aplicación se realizarán directamente en el servidor de destino previo al inicio de operaciones.
