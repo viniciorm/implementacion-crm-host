@@ -16,6 +16,9 @@
 | Ejecuciones superpuestas en sincronización programada | Implementar bloqueo atómico de aislamiento (`Cache::lock`) y auditoría de eventos omitidos. | Comprobado en prueba de comando CLI con bloqueo activo |
 | Incompatibilidad de parche en PHP del hosting (8.4.0 vs 8.4.1+) | Fijar `"platform": { "php": "8.4.0" }` en gestor de dependencias y verificar árbol sin dependencias superiores. | Comprobado mediante validación de `composer.lock` y ejecución de suite completa |
 | Mutación de datos en la planilla de origen | Actualizar selectivamente atributos de contacto de origen preservando intactos estados, notas y asignaciones internas. | Comprobado en prueba de sincronización posterior con mutación de campos |
+| Rotación imprevista de claves del proveedor de identidad | Detectar `kid` ausente en certificados en caché y forzar recarga de JWKS antes de validar firma. | Comprobado en prueba de rotación de claves criptográficas |
+| Sobrescritura de asignaciones manuales en reconciliación | Proteger leads con asignaciones manuales previas (`assigned_user_id !== null`) marcándolos resueltos sin alterar responsable. | Comprobado en prueba de preservación estricta de asignación manual |
+| Bloqueo residual ante fallo imprevisto de sincronización | Garantizar liberación del bloqueo compartido en bloque `finally` en interfaces web y CLI. | Comprobado en pruebas de excepciones forzadas en comando y controlador |
 | Pérdida de datos | Programar respaldos independientes y ensayar restauración. | Procedimiento documentado; pendiente comprobación operativa en panel |
 
 Las pruebas con datos reales no deben realizarse hasta validar permisos, HTTPS, respaldo y aislamiento en un entorno apropiado.

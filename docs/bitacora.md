@@ -95,44 +95,69 @@ Se implementó la lectura de las hojas de cálculo autorizadas mediante una cuen
 - Idempotencia: cálculo de clave única basada en hoja e ID de origen; ejecuciones posteriores actualizan marcas de tiempo pero conservan intactos los estados comerciales, notas de gestión, reasignaciones internas y seguimientos.
 - Trazabilidad y auditoría: registro de cada inicio de sesión, cambio de estado, reasignación, creación de gestión y sincronización en tablas dedicadas.
 
-## Autenticación de identidad robusta y doble verificación concurrente
+## Validación de identidad offline mediante JWKS y rotación de claves
 
-Para proteger el flujo de autenticación federada sin dependencias externas innecesarias:
+Para eliminar la dependencia de peticiones HTTP a endpoints secundarios de depuración en producción:
 
-- Verificación integral de tokens: validación criptográfica del `id_token` mediante el servicio de comprobación oficial del proveedor, verificando emisor (`iss`), audiencia coincidente con el identificador de cliente (`aud`), expiración (`exp`) y confirmación del correo electrónico (`email_verified`).
-- Verificación cruzada: cotejo estricto del identificador único (`sub`) obtenido del `id_token` frente a los datos devueltos por el endpoint de perfil (`userinfo`).
-- Bloqueo pesimista con revalidación post-bloqueo (doble comprobación):
-  - Al recibir una solicitud de vinculación inicial, se obtiene un bloqueo exclusivo de fila (`lockForUpdate`).
-  - Inmediatamente tras adquirir el bloqueo, se revalida que el usuario permanezca activo, no haya sido vinculado concurrentemente por otra solicitud paralela y no colisione con otra cuenta.
-  - Esto garantiza que dos solicitudes simultáneas no puedan sobrescribir la identidad ni dejar el registro en un estado inconsistente.
+- Validación criptográfica offline: se sustituyó la consulta a endpoints de inspección por verificación directa mediante la biblioteca mantenida `firebase/php-jwt` (v7.2.1), verificando la firma digital RS256 con los certificados públicos oficiales del proveedor (JWKS).
+- Gestión de claves y rotación dinámica:
+  - Las claves públicas se obtienen del endpoint oficial de certificados y se almacenan en caché respetando el valor `max-age` de la cabecera `Cache-Control`.
+  - Si un token recibido contiene un identificador de clave (`kid`) ausente en la caché (por ejemplo, debido a rotación periódica de claves por parte del proveedor), el sistema fuerza automáticamente la recarga del conjunto JWKS antes de evaluar el token.
+  - Si el `kid` no existe tras la recarga, o la firma es inválida, se rechaza de inmediato.
+- Comprobación estricta de claims:
+  - Emisor (`iss`): coincidencia exacta con los dominios autorizados del proveedor.
+  - Audiencia (`aud`): correspondencia estricta con el identificador de cliente configurado.
+  - Expiración (`exp`): rechazo de tokens vencidos.
+  - Correo electrónico confirmado (`email_verified`): rechazo de cuentas con verificación pendiente.
+  - Identificador único (`sub`): validación contra registros previos y bloqueo de carreras concurrentes.
 
-## Mapeo determinista de asesores y actualización selectiva de origen
+## Bloqueo compartido entre procesos desacoplados y control de fallos
 
-En la integración con hojas de cálculo externas:
+Para garantizar que procesos web independientes y tareas programadas por línea de comandos no colisionen:
 
-- Preservación de autoría de origen: el valor original del asesor asignado en la hoja se almacena intacto en un atributo dedicado (`source_assigned_to`).
-- Mapeo explícito y controlado: solo se vinculan prospectos a asesores del sistema formalmente registrados y activos. Todo registro con asesor no habilitado o desconocido se marca de forma transparente como pendiente de conciliación (`reconciliation_pending = true`), sin asignación interna automática ni inferencias heurísticas.
-- Actualización selectiva de origen: al re-ejecutar la sincronización, los atributos de contacto que hayan mutado en la hoja de origen (nombre, teléfono, correo, campaña, estado de notificación) se actualizan en el modelo del prospecto, pero los datos comerciales generados en el sistema (estado comercial, reasignación a usuario interno, notas de actividad, llamadas y compromisos) quedan estrictamente protegidos contra sobreescritura.
+- Controlador de caché entre procesos: se seleccionó el controlador de base de datos (`database` con tablas de caché y bloqueos atómicos), garantizando coherencia transaccional entre peticiones web (FPM/servidor web) y ejecuciones de consola (CLI/Cron) en hosting compartido.
+- Bloqueo compartido unificado: la sincronización manual desde la interfaz administrativa y la sincronización periódica por comando de consola comparten la misma clave de bloqueo atómico (`crm_sheets_sync_shared_lock`).
+- Pruebas de contención y resiliencia:
+  - Una sincronización manual es rechazada si el comando programado está en ejecución.
+  - El comando programado omite su ejecución y registra evento de auditoría si la sincronización manual está activa.
+  - Ante cualquier excepción imprevista (fallo de red, archivo no encontrado o respuesta corrupta de la API externa), el bloqueo se libera estrictamente en el bloque `finally`, evitando bloqueos residuales o bloqueos permanentes innecesarios.
 
-## Tareas programadas seguras y compatibilidad de plataforma
+## Reconciliación explícita de prospectos al habilitar asesores
 
-- Comando CLI con bloqueo de aislamiento: se construyó un comando de consola dedicado para sincronización programada, protegido mediante bloqueo atómico (`Cache::lock`) para prevenir ejecuciones superpuestas ante tareas que tomen más tiempo del intervalo programado. Las omisiones por concurrencia se registran con severidad de auditoría.
-- Fijación de plataforma PHP: en entornos de alojamiento compartido donde PHP 8.4 puede presentarse en versiones de parche como 8.4.0, se fijó explícitamente `"platform": { "php": "8.4.0" }` en la configuración del gestor de dependencias para forzar la resolución de paquetes a versiones plenamente compatibles (evitando subdependencias que exijan PHP >= 8.4.1).
+Para gestionar prospectos previamente importados cuyos responsables originales no estaban habilitados inicialmente:
+
+- Preservación estricta de asignaciones manuales: si un prospecto pendiente fue asignado manualmente por un usuario interno en el CRM, la reconciliación automática respeta y preserva intacta dicha asignación sin sobrescribirla.
+- Resolución determinista sin inferencias: solo se reconcilian prospectos cuyo alias de origen coincida exactamente con un mapeo configurado y cuyo asesor esté activo en la base de datos con el rol respectivo.
+- Trazabilidad y conciliación: los prospectos reconciliados registran una nota de actividad y un evento de auditoría; los prospectos ambiguos o sin asesor habilitado permanecen transparentemente con estado pendiente de conciliación.
 
 ## Verificación integral mediante pruebas automatizadas
 
-Se construyó y ejecutó una suite de pruebas con 37 casos automatizados y 135 aserciones que validaron:
+Se construyó y ejecutó una suite de pruebas con 53 casos automatizados y 200 aserciones que validaron:
 
 1. Rechazo de accesos no autenticados en todas las rutas protegidas.
 2. Rechazo inmediato de usuarios inactivos o no autorizados.
 3. Validación estricta de estado CSRF en el flujo de identidad.
-4. Validación formal del token de identidad y rechazo de tokens expirados o con audiencia inválida.
-5. Doble comprobación post-bloqueo en vinculación concurrente y prevención de carreras.
-6. Aislamiento estricto entre asesores: imposibilidad de que un asesor consulte o modifique prospectos asignados a otro.
-7. Mapeo explícito de asesores de origen y marcado automático de casos ambiguos para conciliación.
-8. Actualización de atributos de contacto modificados en la fuente sin alteración de datos comerciales del sistema.
-9. Rechazo de identificadores duplicados a nivel de lote.
-10. Idempotencia y conservación de notas, llamadas, estados y seguimientos tras sincronizaciones repetidas.
-11. Verificación de que el cliente de hojas realiza exclusivamente peticiones GET y nunca escrituras.
-12. Prevención de ejecuciones superpuestas en el comando CLI mediante bloqueo atómico.
-13. Comprobación de que la configuración, `.env` y archivos privados no residen en el directorio público.
+4. Validación criptográfica offline de `id_token` mediante certificados públicos JWKS.
+5. Rechazo de firmas manipuladas o inválidas.
+6. Rechazo de emisores (`iss`) y audiencias (`aud`) no autorizados.
+7. Rechazo de tokens expirados o con correos no confirmados.
+8. Detección y manejo exitoso de rotación de claves públicas del proveedor.
+9. Doble comprobación post-bloqueo en vinculación concurrente y prevención de carreras.
+10. Aislamiento estricto entre asesores (HTTP 403 verificado).
+11. Mapeo explícito de asesores de origen y marcado automático de casos ambiguos para conciliación.
+12. Reconciliación explícita sin alteración de asignaciones manuales previas.
+13. Actualización de atributos de contacto modificados en la fuente sin alteración de datos comerciales del sistema.
+14. Rechazo de identificadores duplicados a nivel de lote.
+15. Idempotencia y conservación de notas, llamadas, estados y seguimientos tras sincronizaciones repetidas.
+16. Verificación de que el cliente de hojas realiza exclusivamente peticiones GET y nunca escrituras.
+17. Bloqueo compartido entre sincronización manual y comando CLI, previniendo ejecuciones superpuestas.
+18. Liberación garantizada del bloqueo de sincronización ante excepciones y fallos simulados.
+19. Comprobación de que la configuración, `.env` y archivos privados no residen en el directorio público.
+
+## Estado del desarrollo y limitaciones pendientes
+
+- **Commit de referencia:** `915a34be10b7c78fb229704ba91b2dd39e104104` (rama de características del CRM).
+- **Limitaciones pendientes:**
+  - Las tareas periódicas en Cron se encuentran temporalmente desactivadas en el servidor hasta completar la validación manual inicial en producción.
+  - Los asesores con asignaciones históricas no confirmadas permanecen inhabilitados; sus registros se encuentran marcados como pendientes de conciliación.
+  - La ejecución de migraciones en la base de datos final y la generación de la clave criptográfica única de la aplicación se realizarán directamente en el servidor de destino previo al inicio de operaciones.
