@@ -41,3 +41,9 @@ Se agregó una validación previa de lote: cuando un identificador se repite en 
 ## Próximo hito
 
 Preparar e instalar dependencias de Laravel y construir el circuito completo: iniciar sesión, consultar prospectos autorizados, abrir una ficha y guardar una gestión en la base independiente. Probar primero con datos de prueba y revisar la seguridad antes de conectar datos reales.
+
+## Preparación del acceso directo
+
+Se preparó una regla aislada para vincular una identidad previamente verificada con una cuenta ya autorizada y activa. La vinculación debe conservar el identificador estable del proveedor, verificar el correo inicial y rechazar cambios inesperados de identidad. La primera vinculación necesitará una transacción y una restricción única para evitar carreras.
+
+**Estado:** propuesta de código en revisión; no se ejecutaron las pruebas en el entorno actual. La regla no verifica tokens ni implementa sesiones o inicio de sesión. Quedan pendientes la integración con Laravel, pruebas de extremo a extremo y la configuración del proveedor.
