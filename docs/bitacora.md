@@ -95,19 +95,44 @@ Se implementó la lectura de las hojas de cálculo autorizadas mediante una cuen
 - Idempotencia: cálculo de clave única basada en hoja e ID de origen; ejecuciones posteriores actualizan marcas de tiempo pero conservan intactos los estados comerciales, notas de gestión, reasignaciones internas y seguimientos.
 - Trazabilidad y auditoría: registro de cada inicio de sesión, cambio de estado, reasignación, creación de gestión y sincronización en tablas dedicadas.
 
+## Autenticación de identidad robusta y doble verificación concurrente
+
+Para proteger el flujo de autenticación federada sin dependencias externas innecesarias:
+
+- Verificación integral de tokens: validación criptográfica del `id_token` mediante el servicio de comprobación oficial del proveedor, verificando emisor (`iss`), audiencia coincidente con el identificador de cliente (`aud`), expiración (`exp`) y confirmación del correo electrónico (`email_verified`).
+- Verificación cruzada: cotejo estricto del identificador único (`sub`) obtenido del `id_token` frente a los datos devueltos por el endpoint de perfil (`userinfo`).
+- Bloqueo pesimista con revalidación post-bloqueo (doble comprobación):
+  - Al recibir una solicitud de vinculación inicial, se obtiene un bloqueo exclusivo de fila (`lockForUpdate`).
+  - Inmediatamente tras adquirir el bloqueo, se revalida que el usuario permanezca activo, no haya sido vinculado concurrentemente por otra solicitud paralela y no colisione con otra cuenta.
+  - Esto garantiza que dos solicitudes simultáneas no puedan sobrescribir la identidad ni dejar el registro en un estado inconsistente.
+
+## Mapeo determinista de asesores y actualización selectiva de origen
+
+En la integración con hojas de cálculo externas:
+
+- Preservación de autoría de origen: el valor original del asesor asignado en la hoja se almacena intacto en un atributo dedicado (`source_assigned_to`).
+- Mapeo explícito y controlado: solo se vinculan prospectos a asesores del sistema formalmente registrados y activos. Todo registro con asesor no habilitado o desconocido se marca de forma transparente como pendiente de conciliación (`reconciliation_pending = true`), sin asignación interna automática ni inferencias heurísticas.
+- Actualización selectiva de origen: al re-ejecutar la sincronización, los atributos de contacto que hayan mutado en la hoja de origen (nombre, teléfono, correo, campaña, estado de notificación) se actualizan en el modelo del prospecto, pero los datos comerciales generados en el sistema (estado comercial, reasignación a usuario interno, notas de actividad, llamadas y compromisos) quedan estrictamente protegidos contra sobreescritura.
+
+## Tareas programadas seguras y compatibilidad de plataforma
+
+- Comando CLI con bloqueo de aislamiento: se construyó un comando de consola dedicado para sincronización programada, protegido mediante bloqueo atómico (`Cache::lock`) para prevenir ejecuciones superpuestas ante tareas que tomen más tiempo del intervalo programado. Las omisiones por concurrencia se registran con severidad de auditoría.
+- Fijación de plataforma PHP: en entornos de alojamiento compartido donde PHP 8.4 puede presentarse en versiones de parche como 8.4.0, se fijó explícitamente `"platform": { "php": "8.4.0" }` en la configuración del gestor de dependencias para forzar la resolución de paquetes a versiones plenamente compatibles (evitando subdependencias que exijan PHP >= 8.4.1).
+
 ## Verificación integral mediante pruebas automatizadas
 
-Se construyó y ejecutó una suite de pruebas con 29 casos automatizados y 103 aserciones que validaron:
+Se construyó y ejecutó una suite de pruebas con 37 casos automatizados y 135 aserciones que validaron:
 
 1. Rechazo de accesos no autenticados en todas las rutas protegidas.
 2. Rechazo inmediato de usuarios inactivos o no autorizados.
 3. Validación estricta de estado CSRF en el flujo de identidad.
-4. Rechazo de correos no verificados por el proveedor.
-5. Vinculación atómica del identificador único y prevención de colisiones.
-6. Aislamiento entre asesores: imposibilidad de que un asesor consulte o modifique prospectos asignados a otro.
-7. Mapeo de encabezados para los cuatro esquemas soportados y detección de encabezados ambiguos o faltantes.
-8. Rechazo de duplicados a nivel de lote.
-9. Idempotencia y conservación de datos comerciales tras sincronizaciones repetidas.
-10. Persistencia real de notas, llamadas, estados y seguimientos.
+4. Validación formal del token de identidad y rechazo de tokens expirados o con audiencia inválida.
+5. Doble comprobación post-bloqueo en vinculación concurrente y prevención de carreras.
+6. Aislamiento estricto entre asesores: imposibilidad de que un asesor consulte o modifique prospectos asignados a otro.
+7. Mapeo explícito de asesores de origen y marcado automático de casos ambiguos para conciliación.
+8. Actualización de atributos de contacto modificados en la fuente sin alteración de datos comerciales del sistema.
+9. Rechazo de identificadores duplicados a nivel de lote.
+10. Idempotencia y conservación de notas, llamadas, estados y seguimientos tras sincronizaciones repetidas.
 11. Verificación de que el cliente de hojas realiza exclusivamente peticiones GET y nunca escrituras.
-12. Comprobación de que la configuración, `.env` y archivos privados no residen en el directorio público.
+12. Prevención de ejecuciones superpuestas en el comando CLI mediante bloqueo atómico.
+13. Comprobación de que la configuración, `.env` y archivos privados no residen en el directorio público.
