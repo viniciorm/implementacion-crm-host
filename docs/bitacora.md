@@ -129,11 +129,13 @@ Para proteger la integridad de las asignaciones ante operaciones simultáneas en
 - Bloqueo exclusivo dentro de transacción: en lugar de confiar en datos leídos previamente fuera del contexto transaccional, el proceso de reconciliación vuelve a consultar y bloquea explícitamente tanto el registro del prospecto como su fila de gestión (`SELECT ... FOR UPDATE` en `leads` y `lead_management`).
 - Detección de asignación manual concurrente: si un administrador o asesor asigna un prospecto manualmente mientras el proceso de reconciliación evalúa el lote, al adquirir el bloqueo exclusivo el proceso detecta que `assigned_user_id` ya no es nulo, preserva intacta la asignación manual previa y marca el prospecto como resuelto sin sobrescribir con el asesor automático.
 - Prueba con dos procesos concurrentes sincronizados para MySQL / MariaDB (InnoDB):
+  - Exigencia estricta de base de datos aislada: la prueba requiere explícitamente una base de datos de pruebas configurada (ej. `nombre_crm_test`) y prohíbe de forma terminante usar la base de datos principal (`DB_DATABASE`) como alternativa o destino, previniendo cualquier afectación a datos del sistema.
   - Se implementó una prueba reproducible con dos subprocesos del sistema operativo (`proc_open`) conectados a InnoDB.
   - El Proceso A inicia transacción y adquiere `SELECT ... FOR UPDATE` sobre la fila de gestión.
-  - El Proceso B inicia transacción concurrente e intenta ejecutar `SELECT ... FOR UPDATE` sobre la misma fila, quedando físicamente retenido en `LOCK WAIT` por el motor de base de datos.
-  - El Proceso A retiene el bloqueo intencionalmente durante un intervalo medible, realiza la asignación manual a un asesor y ejecuta `COMMIT`.
-  - El Proceso B se desbloquea inmediatamente tras el `COMMIT`, mide el tiempo de espera efectivo (demostrando la exclusión mutua de InnoDB), comprueba que la fila ya tiene asignación manual y la preserva sin sobrescribirla.
+  - El Proceso B inicia transacción concurrente e intenta ejecutar el servicio real de reconciliación (`AdvisorAssignmentResolver::reconcilePendingLeads`), quedando físicamente retenido en `LOCK WAIT` por el motor de base de datos.
+  - El Proceso A retiene el bloqueo intencionalmente por 1.4 segundos (tiempo medible), realiza la asignación manual a un asesor y ejecuta `COMMIT`.
+  - El Proceso B se desbloquea inmediatamente tras el `COMMIT`, mide el tiempo de espera efectivo (demostrando que esperó en InnoDB durante la retención del bloqueo), ejecuta la reconciliación y preserva la asignación manual previa sin sobrescribirla.
+  - Ejecución segura sin exposición de credenciales: las credenciales se cargan desde un archivo seguro con permisos restringidos (600) y se transmiten a los subprocesos mediante variables de entorno del sistema operativo (`proc_open`), impidiendo que aparezcan en la lista de procesos (`ps aux`), en la interfaz de tareas programadas del panel de control o en los registros de salida.
   - Distinción estricta de pruebas omitidas: si el servidor MySQL no se encuentra disponible o no se configuró una base de datos de pruebas aislada, la prueba se reporta de forma inequívoca como **OMITIDA (SKIPPED)** tanto en PHPUnit como en el ejecutable CLI (`[PRUEBA OMITIDA - NO APROBADA]`), impidiendo presentarla falsamente como aprobada en entornos SQLite en memoria.
 
 ## Mitigación de tareas extensas (>600s), renovación estricta y uso de la opción forzada
@@ -182,7 +184,7 @@ Se construyó y ejecutó una suite de pruebas con 60 casos automatizados y 231 a
 
 ## Estado del desarrollo y limitaciones pendientes
 
-- **Commit de referencia:** `9732330bae229973d93c566e84cbdc52eaf1dc0d` (rama de características del CRM).
+- **Commit de referencia:** `9e2a55f498843941d1c7751333b68a3de92f718d` (rama de características del CRM).
 - **Limitaciones pendientes:**
   - Las tareas periódicas en Cron se encuentran temporalmente desactivadas en el servidor hasta completar la validación manual inicial en producción.
   - Los asesores con asignaciones históricas no confirmadas permanecen inhabilitados; sus registros se encuentran marcados como pendientes de conciliación.
